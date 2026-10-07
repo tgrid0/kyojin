@@ -9,6 +9,18 @@ from . import Module
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 
+def conv2d_one_window(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+    """F.conv2d(x, weight, bias, stride = kernel) for x of shape (N, C, kh, kw), the input being exactly one kernel
+    window, as a matmul. Result (N, 1, out_channels), same as conv2d(...).flatten(2).permute(0, 2, 1).
+
+    MIOpen searches a solution again for every new batch size N (60-100 s per new picture size on gfx1151 without
+    its perf database), and N is the number of merged vision tokens, so every new picture size stalled the tower."""
+    y = x.flatten(1) @ weight.flatten(1).T
+    if bias is not None:
+        y = y + bias
+    return y.unsqueeze(1)
+
+
 class Conv(Module):
 
     def __init__(
@@ -87,8 +99,12 @@ class Conv(Module):
         if self.dims == 2:
             if self.reshape2d:
                 x = x.view(-1, self.kernel_size[0], self.kernel_size[1], x.shape[-1]).permute(0, 3, 1, 2)
-            y = F.conv2d(x.to(self.weight.dtype), self.weight, self.bias, self.kernel_size)
-            y = y.flatten(2).permute(0, 2, 1).contiguous()
+            x = x.to(self.weight.dtype)
+            if self.reshape2d:
+                y = conv2d_one_window(x, self.weight, self.bias).contiguous()
+            else:
+                y = F.conv2d(x, self.weight, self.bias, self.kernel_size)
+                y = y.flatten(2).permute(0, 2, 1).contiguous()
 
         elif self.dims == 3:
             bsz, seqlen, dim = x.shape
