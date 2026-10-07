@@ -28,6 +28,8 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `--chat-template` | the model's `chat_template.jinja` | Jinja template file; `tools/lanes/assets/glm53-template-medium.jinja` is the one the lane uses |
 | `--default-temperature` / `--default-top-p` | `0.0` / `1.0` | used when a request omits the field (explicit null too). The lane passes `1.0` / `0.95`: greedy defaults loop on agent clients |
 | `--default-reasoning-effort` | none | template `reasoning_effort` when a request omits it (the lane passes `medium`) |
+| `--no-vision` | off | do not load the vision tower (about 0.3 GB of GPU memory); image requests then get a 400 |
+| `--max-image-tokens` | `1280` | cap on the embedding rows of one image (the processor allows 8000) |
 | `--max-history` | `1` | recurrent history slots; must equal draft tokens (1 for MTP). Each extra slot costs ~2.15 GiB |
 
 Env vars the server sets for itself via `os.environ.setdefault` (so an external value
@@ -78,7 +80,7 @@ Honored:
 
 Ignored (accepted, no effect): `n`, `seed`, `logprobs`, `top_k`, `presence_penalty`,
 `frequency_penalty`, `response_format`, `stream_options`, `user`, `parallel_tool_calls`,
-`tool_choice`, multimodal content parts (images are never sent to the vision tower).
+`tool_choice`. Image parts are not ignored, see [Images](#images).
 
 ### Streaming format
 `Content-Type: text/event-stream`. Every frame is a bare `data: {...}` line (no `event:`
@@ -100,6 +102,40 @@ Every frame carries `id`, `object: chat.completion.chunk`, `created`, `model`.
 
 Non-streaming returns `chat.completion` with `choices[0].message` holding `content`,
 optional `reasoning_content`, optional `tool_calls`, plus `usage`.
+
+### Images
+
+`image_url` content parts (`{"type":"image_url","image_url":{"url":...}}`) are answered with the vision tower
+that ships in the pack.
+
+- URL: a `data:` URI or an `http(s)` URL; at most 20 MB. Anything else, an image that does not decode, or a URL that
+  cannot be fetched is a 400 (also when `stream` is true), and the server keeps serving.
+- Images are allowed in `user` messages only (400 otherwise). No video. `/completion` and `/v1/completions` take no
+  images.
+- Size: the picture is scaled to at most `--max-image-tokens` embedding rows (default 1280, about a megapixel
+  of picture); an 8000x8000 image stays at that cap. Measured: a 640x800 photo is 667 rows, a 3000x2000 photo about 1300
+  prompt tokens. `usage.prompt_tokens` counts the real rows.
+- `--no-vision`, or a pack without the tower, answers image requests with 400 `this server runs without the vision tower`.
+- The pack's chat template says the model cannot process images and replaces image parts by a reminder. The server
+  therefore swaps every image for a marker before rendering and puts the embedding in afterwards. The marker text
+  `<|exl3_image|>` must not appear in user text (that request gets a 400).
+- Speculative decoding (MTP) stays on for image requests.
+
+**Prefix reuse.** Pictures are cached by pixel content (8 most recent), so the same picture in the next turn keeps
+its token ids and the KV pages and recurrent checkpoints of the earlier turn still match. Measured (6.4K-token prompt
+with a picture, second turn adds a follow-up): 6400 of 6455 prompt tokens came from cache, 2.3 s against 25 s cold;
+without the cache only the text ahead of the picture was reused. Limits: reuse needs the same picture and everything
+before it unchanged; the same picture twice in one message is embedded twice and that request is not reused by the
+next; a prompt shorter than the recurrent checkpoint spacing reuses little (a 700-token prompt reused 512 tokens).
+A reused turn gives the same text as a cold one wherever the cold run itself repeats (MTP decoding is not bit-stable
+between runs: 1 of 6 follow-ups differed for the image prompt, 2 of 6 for a text-only control).
+
+**What was measured** (one Strix Halo machine, MTP 2, `-c 32768` and `-c 524288`): a cat photo, a line drawing, an
+invoice text image and a bar chart were described correctly (the chart values were read); text-only prefill (655
+tok/s) and decode (30 to 33 tok/s) are the same with and without the tower; at `-c 524288` the server loads with the
+tower and runs at 117 of 124 GiB. Not measured: more than one picture-heavy conversation at long context, photos
+with fine print, video. The vendor template says the model cannot see images; the checkpoint nevertheless answers
+about them correctly in these tests, but it was not trained or evaluated for it by the vendor as far as is known.
 
 ### Thinking
 GLM's generation prompt ends with `<think>`, so the model *starts inside* the block.

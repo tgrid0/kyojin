@@ -45,6 +45,8 @@ GLM reasons at maximum effort by default. With a small `max_tokens`, the reasoni
 
 GLM: the pack ships `mtp_eh_proj.st`, an unquantized MTP `eh_proj` (64 MiB). The server loads it automatically from the model folder; it raises draft acceptance and decode speed (26.7 -> 31.6 tok/s greedy on the card protocol). Details in `tools/glm/SERVE.md`.
 
+GLM images: the server answers `image_url` parts with the pack's vision tower (`--no-vision` turns it off, `--max-image-tokens` caps the size) and reuses the cached prefix for a picture sent again. Details and measurements in `tools/glm/SERVE.md`. Needs the engine built from this source: an older build converts every new picture size slowly (1 to 2 minutes).
+
 Memory: GLM at `-c 131072` leaves about 10 GiB free on a 128 GB machine. Close browsers and other large processes first, or use a smaller `-c`.
 
 MiMo: `hf download yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz --local-dir ./mimo-pack`, then `python tools/mimo/serve.py --model ./mimo-pack --port 8000 -c 131072`. Speculative decoding (DFlash, 4 bpw drafter, confidence-truncated drafts) is on by default: the server uses the pack's `drafter/` directory (or `$MIMO_DRAFTER`, or `--drafter <dir>`). Without a drafter it logs one line and decodes plain. Set `MIMO_SPEC=0` in the lane script (`tools/lanes/serve_mimo.sh`) or pass `--no-dflash` to `serve.py` for plain decode. Greedy output under speculation is token-identical to plain decode (exact verify arithmetic). `EXL3_MIMO_LOSSLESS=0` selects a slightly faster verify that is not token-identical: near-tied logits can flip. A loaded drafter costs 2 to 4 % prefill. Details: `tools/mimo/SERVE.md`.
