@@ -271,6 +271,61 @@ class ServeTests(unittest.TestCase):
         self.assertEqual(prompt.count(serve.IMAGE_MARK), 1)
         self.assertNotIn("DROPPED", prompt)
 
+    def test_usage_counts_the_real_image_tokens(self):
+        class Engine(FakeEngine):
+            supports_vision = True
+            last_prompt_tokens = 500          # what the engine really prefilled: text plus image embedding rows
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def go(messages):
+            client = TestClient(TestServer(serve.create_app(Engine("ok"), "m", self.image_template)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={"model": "m", "messages": messages})
+            body = await r.json()
+            await client.close()
+            return body
+        with_image = run(go(self.user_with_images(self.png_url())))
+        self.assertEqual(with_image["usage"]["prompt_tokens"], 500)
+        text_only = run(go([{"role": "user", "content": "hi there"}]))
+        self.assertEqual(text_only["usage"]["prompt_tokens"], 2)      # FakeEngine counts words of the rendered prompt
+
+    def test_embedding_cache_reuses_equal_pictures(self):
+        from PIL import Image
+        made = []
+
+        def embed(image):
+            made.append(image)
+            return object()
+
+        cache = serve.EmbeddingCache(capacity=2)
+        red = Image.new("RGB", (8, 6), (200, 30, 30))
+        first = cache.get(red, embed)
+        self.assertIs(cache.get(Image.new("RGB", (8, 6), (200, 30, 30)), embed), first)   # same pixels, other object
+        self.assertEqual(len(made), 1)
+        self.assertIsNot(cache.get(Image.new("RGB", (8, 6), (200, 30, 31)), embed), first)  # one pixel value differs
+        self.assertIsNot(cache.get(Image.new("RGB", (6, 8), (200, 30, 30)), embed), first)  # same colour, other size
+        self.assertEqual(len(made), 3)
+
+    def test_embedding_cache_is_lru(self):
+        from PIL import Image
+        cache = serve.EmbeddingCache(capacity=2)
+        pics = [Image.new("RGB", (4, 4), (i, i, i)) for i in range(3)]
+        embs = [cache.get(p, lambda im: object()) for p in pics[:2]]
+        self.assertIs(cache.get(pics[0], lambda im: self.fail("evicted too early")), embs[0])   # touch 0: 1 is oldest
+        cache.get(pics[2], lambda im: object())                                                  # evicts 1
+        self.assertIs(cache.get(pics[0], lambda im: self.fail("0 was kept")), embs[0])
+        self.assertIsNot(cache.get(pics[1], lambda im: object()), embs[1])
+
+    def test_embedding_cache_never_shares_one_object_inside_a_request(self):
+        from PIL import Image
+        cache = serve.EmbeddingCache(capacity=4)
+        red = Image.new("RGB", (4, 4), (9, 9, 9))
+        a = cache.get(red, lambda im: object())
+        b = cache.get(red, lambda im: object(), taken=[a])        # the same picture twice in one prompt
+        self.assertIsNot(a, b)
+        self.assertIs(cache.get(red, lambda im: self.fail("cached")), a)   # the first one stays the cached one
+
     def test_template_rendering(self):
         out = serve.render_prompt(self.template, [{"role": "user", "content": "hi"}], [{"type": "function"}])
         self.assertEqual(out, "<|im_start|>user: hi<|im_end|>TOOLS=1")

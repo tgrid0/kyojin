@@ -190,6 +190,44 @@ def load_image(url: str):
         raise BadRequest(f"cannot decode image: {exc}") from exc
 
 
+class EmbeddingCache:
+    """Recently embedded pictures, keyed by pixel content (not by URL).
+
+    Every new MMEmbedding takes fresh token ids from a process-wide allocator, and those ids are what the KV pages
+    are hashed on. Embedding the same picture again next turn would therefore never match the pages of the first
+    turn; handing back the same embedding object keeps its ids, so the prefix up to and past the picture is reused."""
+
+    def __init__(self, capacity: int = 8):
+        self.capacity = capacity
+        self.items: dict[str, Any] = {}
+
+    @staticmethod
+    def key(image: Any) -> str:
+        import hashlib
+        h = hashlib.sha256(f"{image.mode}|{image.size[0]}x{image.size[1]}|".encode())
+        h.update(image.tobytes())
+        return h.hexdigest()
+
+    def get(self, image: Any, embed: Any, taken: Any = ()) -> Any:
+        """The embedding of `image`, computed with embed(image) when it is not cached.
+
+        `taken` holds the embeddings already used in the current prompt: one object must not stand for two
+        places of one prompt (the same ids twice), so a repeat inside a prompt is embedded afresh and not cached."""
+        k = self.key(image)
+        hit = self.items.pop(k, None)
+        if hit is not None and not any(hit is t for t in taken):
+            self.items[k] = hit                       # most recently used last
+            return hit
+        emb = embed(image)
+        if hit is not None:
+            self.items[k] = hit
+        else:
+            self.items[k] = emb
+            while len(self.items) > self.capacity:
+                self.items.pop(next(iter(self.items)))
+        return emb
+
+
 def render_prompt(template: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
                   **kwargs: Any) -> str:
     """Render the model's own Jinja chat template."""
@@ -311,7 +349,8 @@ class ResidentEngine:
     """One loaded target model, optional MTP model, and resident paged caches."""
     supports_prefix_reuse = True
 
-    def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1):
+    def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1,
+                 vision: bool = True, max_image_tokens: int = 1280):
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         from exllamav3.generator import generator as GM
@@ -333,6 +372,18 @@ class ResidentEngine:
         self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
                                  max_history=max_history)
         self.draft_model.load(device="cuda:0", progressbar=False)
+        # The vision tower ships in the pack (EXL3, about 1 GB). Without it, or with --no-vision, images are refused.
+        self.vision = None
+        self.last_prompt_tokens = 0
+        if vision:
+            try:
+                self.config.vision_pp.max_image_tokens = min(self.config.vision_pp.max_image_tokens, max_image_tokens)
+                self.vision = Model.from_config(self.config, component="vision")
+                self.vision.load(device="cuda:0", progressbar=False)
+            except Exception as exc:                                  # noqa: BLE001
+                self.vision = None
+                print(f"serve: vision tower not loaded ({exc!r}); image input disabled", flush=True)
+        self.supports_vision = self.vision is not None
         self.greedy_generator = Generator(
             model=self.model, cache=self.cache, tokenizer=self.tokenizer,
             draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=num_draft,
@@ -346,9 +397,13 @@ class ResidentEngine:
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, encode_special_tokens=True).numel())
 
+    def _embed(self, images: list) -> list:
+        """One MMEmbedding per PIL image, in prompt order (blocking GPU work: run in an executor)."""
+        return [self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=image) for image in images]
+
     async def generate(self, prompt: str, *, max_tokens: int, temperature: float,
                        top_p: float, stop: list[str], sampler_kw: dict | None = None,
-                       cancel: asyncio.Event | None = None) -> AsyncIterator[str]:
+                       cancel: asyncio.Event | None = None, images: list | None = None) -> AsyncIterator[str]:
         """Yield incremental decoded text. Caller serializes access to this method.
 
         When `cancel` is set (client gone) the job is cancelled between two generator steps. A step is one
@@ -358,7 +413,17 @@ class ResidentEngine:
         from exllamav3.generator.sampler import ComboSampler, GreedySampler
         t0 = time.perf_counter()
         probe = getattr(self, "rss_probe", None)
-        ids = self.tokenizer.encode(prompt, encode_special_tokens=True)
+        embs = []
+        if images:
+            if not self.supports_vision:
+                raise BadRequest("this server runs without the vision tower (--no-vision)")
+            embs = await asyncio.get_running_loop().run_in_executor(None, self._embed, images)
+            for emb in embs:
+                prompt = prompt.replace(IMAGE_MARK, emb.text_alias, 1)
+        ids = self.tokenizer.encode(prompt, encode_special_tokens=True, **({"embeddings": embs} if embs else {}))
+        self.last_prompt_tokens = int(ids.numel())
+        if embs:       # the handler counted each picture as its marker text; its embedding rows are many more tokens
+            max_tokens = min(max_tokens, reply_room(self, int(ids.numel())))
         if getattr(self, "slot_store", None) is not None:
             self.slot_store.note_prompt(prompt, ids)
         self.last_stats = {}
@@ -372,7 +437,7 @@ class ResidentEngine:
         generator = self.greedy_generator
         conditions = list(self.config.eos_token_id_list) + stop
         job = self.Job(input_ids=ids, max_new_tokens=max_tokens, sampler=sampler,
-                       stop_conditions=conditions)
+                       stop_conditions=conditions, embeddings=embs or None)
         generator.enqueue(job)
         loop = asyncio.get_running_loop()
         try:
@@ -635,10 +700,15 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         def deltas() -> AsyncIterator[str]:
             return drain(request, cancel, out)
 
+        def prompt_n() -> int:
+            # The handler counted an image as its marker text; the engine knows the real number after embedding.
+            real = getattr(engine, "last_prompt_tokens", None) if body.get("_images") else None
+            return int(real) if real else prompt_tokens
+
         def usage(raw: str) -> dict[str, int]:
             completion_tokens = engine.count_tokens(raw)
-            return {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens}
+            return {"prompt_tokens": prompt_n(), "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_n() + completion_tokens}
 
         def finish_for(message: dict[str, Any], raw: str) -> str:
             # A reply cut by max_tokens is "length", not "stop" (clients use it to tell a truncated answer).
@@ -653,9 +723,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             cache_n = int(st.get("cached_tokens", 0))
             pre, gen = st.get("time_prefill") or 0.0, st.get("time_generate") or 0.0
             n = int(st.get("new_tokens", 0))
-            return {"cache_n": cache_n, "prompt_n": max(prompt_tokens - cache_n, 0),
+            return {"cache_n": cache_n, "prompt_n": max(prompt_n() - cache_n, 0),
                     "prompt_ms": pre * 1000, "predicted_n": n, "predicted_ms": gen * 1000,
-                    "prompt_per_second": (prompt_tokens - cache_n) / pre if pre else 0.0,
+                    "prompt_per_second": (prompt_n() - cache_n) / pre if pre else 0.0,
                     "predicted_per_second": n / gen if gen else 0.0}
 
         if body.get("stream", False):
@@ -859,6 +929,8 @@ def main() -> None:
     parser.add_argument("--chat-template", default=None, help="Jinja chat template file (default: the model's)")
     parser.add_argument("--default-temperature", type=float, default=0.0, help="used when a request omits temperature")
     parser.add_argument("--default-top-p", type=float, default=1.0, help="used when a request omits top_p")
+    parser.add_argument("--no-vision", action="store_true", help="do not load the vision tower; image input is refused (saves about 1 GB)")
+    parser.add_argument("--max-image-tokens", type=int, default=1280, help="cap on the embedding rows of one image (the processor allows 8000)")
     parser.add_argument("--default-reasoning-effort", default=None, help="template reasoning_effort when a request omits it")
     args = parser.parse_args()
     if args.no_uncensor:
@@ -869,7 +941,9 @@ def main() -> None:
         os.environ.setdefault(key, value)
     os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
     apply_eh_sidecar_default(args.model)
-    engine = ResidentEngine(args.model, max_history=args.max_history or args.num_draft, max_ctx=args.max_ctx, num_draft=args.num_draft)
+    engine = ResidentEngine(args.model, max_history=args.max_history or args.num_draft, max_ctx=args.max_ctx, num_draft=args.num_draft,
+                            vision=not args.no_vision, max_image_tokens=args.max_image_tokens)
+    print(f"serve: vision input {'on, up to ' + str(args.max_image_tokens) + ' tokens per image' if engine.supports_vision else 'off'}", flush=True)
     template = Path(args.chat_template or Path(args.model) / "chat_template.jinja").expanduser().read_text(encoding="utf-8")
     print(mem_line("loaded"), flush=True)
     # Warm-up before the slot store is attached, so the warm-up prompt never shows in /slots.
