@@ -147,6 +147,33 @@ class ServeTests(unittest.TestCase):
         self.assertEqual(run(post(" ".join("w" * 30))), 400)
         self.assertIsNone(engine.kwargs)
 
+    def test_mark_images_replaces_parts_in_order(self):
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": "a"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}}]}]
+        out = serve.mark_images(msgs)
+        self.assertEqual([p["text"] for p in out[0]["content"]], ["a", serve.IMAGE_MARK, serve.IMAGE_MARK])
+        self.assertEqual(len(serve.extract_images(msgs)), 2)
+        self.assertEqual(msgs[0]["content"][1]["type"], "image_url")   # the input is not modified
+
+    def test_image_in_assistant_message_rejected(self):
+        msgs = [{"role": "assistant", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]
+        with self.assertRaises(serve.BadRequest):
+            serve.mark_images(msgs)
+
+    def test_load_image_rejects_non_data_non_http(self):
+        with self.assertRaises(serve.BadRequest):
+            serve.load_image("file:///etc/passwd")
+
+    def test_load_image_rejects_undecodable_and_oversize(self):
+        for url in ("data:image/png;base64,!!!notbase64", "data:image/png;base64,AAAA", "data:image/png", ""):
+            with self.assertRaises(serve.BadRequest, msg=url):
+                serve.load_image(url)
+        big = "data:image/png;base64," + "A" * (serve.MAX_IMAGE_BYTES * 4 // 3 + 16)
+        with self.assertRaises(serve.BadRequest):
+            serve.load_image(big)
+
     def test_template_rendering(self):
         out = serve.render_prompt(self.template, [{"role": "user", "content": "hi"}], [{"type": "function"}])
         self.assertEqual(out, "<|im_start|>user: hi<|im_end|>TOOLS=1")

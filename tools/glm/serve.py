@@ -5,11 +5,14 @@ from __future__ import annotations
 import traceback
 import argparse
 import asyncio
+import base64
+import io
 import json
 import os
 import re
 import sys
 import time
+import urllib.request
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -118,6 +121,73 @@ def template_kwargs(body: dict[str, Any]) -> dict[str, Any]:
     if effort is not None:
         kw["reasoning_effort"] = effort
     return kw
+
+
+IMAGE_MARK = "<|exl3_image|>"
+MAX_IMAGE_BYTES = 20 * 1024**2
+
+
+class BadRequest(Exception):
+    """A request the client must fix (HTTP 400)."""
+
+
+def _is_image_part(part: Any) -> bool:
+    return isinstance(part, dict) and (part.get("type") in ("image_url", "image") or "image_url" in part)
+
+
+def extract_images(messages: list[dict[str, Any]]) -> list[str]:
+    """Image URLs of the messages in prompt order (OpenAI image_url parts)."""
+    urls = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if _is_image_part(part):
+                    iu = part.get("image_url", part.get("image"))
+                    urls.append(iu.get("url") if isinstance(iu, dict) else iu)
+    return urls
+
+
+def mark_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copies of the messages in which every image part is a text part holding IMAGE_MARK.
+
+    The vendor chat template replaces image parts by a "cannot process" reminder but passes text parts through,
+    so the marker survives rendering and is swapped for the embedding's alias afterwards."""
+    out = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list) and any(_is_image_part(p) for p in content):
+            if m.get("role") != "user":
+                raise BadRequest("images are allowed in user messages only")
+            m = dict(m, content=[{"type": "text", "text": IMAGE_MARK} if _is_image_part(p) else p for p in content])
+        out.append(m)
+    return out
+
+
+def load_image(url: str):
+    """PIL image from a data: URI or an http(s) URL (size capped)."""
+    from PIL import Image
+    if not isinstance(url, str) or not url:
+        raise BadRequest("image_url needs a url")
+    if url.startswith("data:"):
+        try:
+            raw = base64.b64decode(url.split(",", 1)[1])
+        except Exception as exc:                                      # noqa: BLE001
+            raise BadRequest(f"bad data URI: {exc}") from exc
+    elif url.startswith(("http://", "https://")):
+        try:
+            with urllib.request.urlopen(url, timeout=20) as r:        # noqa: S310
+                raw = r.read(MAX_IMAGE_BYTES + 1)
+        except Exception as exc:                                      # noqa: BLE001
+            raise BadRequest(f"cannot fetch image: {exc}") from exc
+    else:
+        raise BadRequest("image url must be a data: URI or http(s) URL")
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise BadRequest("image too large")
+    try:
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as exc:                                          # noqa: BLE001
+        raise BadRequest(f"cannot decode image: {exc}") from exc
 
 
 def render_prompt(template: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
