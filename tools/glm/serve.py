@@ -549,7 +549,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         body["_prompt"],
                         max_tokens=token_limit(body), temperature=body.get("temperature", 0.0),
                         top_p=body.get("top_p", 1.0), stop=body.get("_stop", []),
-                        cancel=body.get("_cancel")):
+                        cancel=body.get("_cancel"), images=body.get("_images")):
                         out.put_nowait(delta)
                     out.put_nowait(None)
             except Exception as exc:
@@ -600,14 +600,22 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 raise web.HTTPBadRequest(reason="stream must be boolean")
             stops = body.get("stop", [])
             body["_stop"] = [stops] if isinstance(stops, str) else list(stops)
-            prompt = render_prompt(template, body["messages"], body.get("tools"), **template_kwargs(body))
+            images = extract_images(body["messages"])
+            if images and not getattr(engine, "supports_vision", False):
+                raise BadRequest("this server runs without the vision tower (--no-vision)")
+            prompt = render_prompt(template, mark_images(body["messages"]), body.get("tools"), **template_kwargs(body))
+            if len(images) != prompt.count(IMAGE_MARK):
+                raise BadRequest("image parts and image placeholders do not match (images are allowed in user messages only)")
+            # Decoded here so a bad image is a clean 400 (also when streaming) and never reaches the worker.
+            body["_images"] = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: [load_image(url) for url in images])
             prompt_tokens = engine.count_tokens(prompt)
             body["_room"] = reply_room(engine, prompt_tokens)
             body["_prompt"] = prompt
             for key in ("temperature", "top_p"):
                 if body.get(key) is None:
                     body[key] = SERVE_DEFAULTS[key]
-        except (json.JSONDecodeError, web.HTTPException, TypeError) as exc:
+        except (json.JSONDecodeError, web.HTTPException, TypeError, BadRequest) as exc:
             if isinstance(exc, web.HTTPException):
                 raise
             raise web.HTTPBadRequest(reason=str(exc)) from exc
@@ -737,8 +745,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             body = await request.json()
             if not isinstance(body.get("messages"), list) or not body["messages"]:
                 raise web.HTTPBadRequest(reason="messages must be a non-empty array")
-            prompt = render_prompt(template, body["messages"], body.get("tools"), **template_kwargs(body))
-        except (json.JSONDecodeError, web.HTTPException, TypeError) as exc:
+            prompt = render_prompt(template, mark_images(body["messages"]), body.get("tools"), **template_kwargs(body))
+        except (json.JSONDecodeError, web.HTTPException, TypeError, BadRequest) as exc:
             if isinstance(exc, web.HTTPException):
                 raise
             raise web.HTTPBadRequest(reason=str(exc)) from exc
