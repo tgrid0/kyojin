@@ -108,7 +108,7 @@ optional `reasoning_content`, optional `tool_calls`, plus `usage`.
 `image_url` content parts (`{"type":"image_url","image_url":{"url":...}}`) are answered with the vision tower
 that ships in the pack.
 
-- URL: a `data:` URI or an `http(s)` URL; at most 20 MB. Anything else, an image that does not decode, or a URL that
+- URL: a `data:` URI or an `http(s)` URL; at most 20 MB per image, and the whole request body is capped at 16 MB (so a `data:` URI carries an image of about 12 MB at most). Anything else, an image that does not decode, or a URL that
   cannot be fetched is a 400 (also when `stream` is true), and the server keeps serving.
 - Images are allowed in `user` messages only (400 otherwise). No video. `/completion` and `/v1/completions` take no
   images.
