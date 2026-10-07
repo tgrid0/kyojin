@@ -82,7 +82,49 @@ def direct(args: argparse.Namespace) -> int:
             out += ev.get("text", "")
     print(f"prompt {int(ids.numel())} tokens, {time.perf_counter() - t0:.1f} s, speculative {'off' if args.no_spec else 'on'}")
     print("ANSWER:", out.strip())
-    return 0
+    if not args.reuse_check:
+        return 0
+
+    # Prefix reuse must not change the answer. Turn 2 is run with the pages of turn 1 in the cache (warm) and after the
+    # page table is reset (cold), greedy, same prompt. Prefill chunking differs between the two, so a near-tie can
+    # flip even in plain text: the same check runs on a text-only prompt of similar length as the control, and a
+    # cold run is repeated to show the run-to-run floor. Only image mismatches beyond the control count as findings.
+    def turn(prompt2: str, embs: list) -> tuple[str, int, float]:
+        ids2 = tokenizer.encode(prompt2, add_bos=False, encode_special_tokens=True, **({"embeddings": embs} if embs else {}))
+        job2 = Job(input_ids=ids2, max_new_tokens=args.max_new, sampler=GreedySampler(), embeddings=embs or None,
+                   stop_conditions=config.eos_token_id_list)
+        generator.enqueue(job2)
+        text, cached, t1 = "", 0, time.perf_counter()
+        while generator.num_remaining_jobs():
+            for ev in generator.iterate():
+                text += ev.get("text", "")
+                if ev.get("eos"):
+                    cached = int(ev.get("cached_tokens", 0))
+        return text, cached, time.perf_counter() - t1
+
+    questions = ["Now describe it in five words.", "What colour is the hat?", "Is it indoors or outdoors? One sentence.",
+                 "Write a haiku about it.", "List three objects you can see.", "Translate your first answer into German."]
+    filler = "".join(f"Note {i}: the quick brown fox jumps over the lazy dog.\n" for i in range(args.control_lines))
+    base_text = "[gMASK]<sop><|user|>\n" + filler + "Describe a kitten in one sentence.<|assistant|>\n<think></think>"
+    text_first, _, _ = turn(base_text, [])
+    modes = {"image": (prompt + out, [emb]), "text": (base_text + text_first, [])}
+    bad = {"image": 0, "text": 0}
+    for mode, (history, embs) in modes.items():
+        for q in questions:
+            follow = history + "<|user|>\n" + q + "<|assistant|>\n<think></think>"
+            warm, cached, tw = turn(follow, embs)
+            generator.pagetable.reset_page_table()
+            cold, cached_cold, tc = turn(follow, embs)
+            generator.pagetable.reset_page_table()
+            cold2, _, _ = turn(follow, embs)
+            same = warm == cold
+            bad[mode] += not same
+            print(f"{mode:5} warm {tw:4.1f} s cached {cached:4}  cold {tc:4.1f} s  warm==cold {same}  cold==cold {cold == cold2}  {q[:30]!r}")
+            if not same:
+                print("   WARM:", warm.strip()[:160].replace("\n", " "))
+                print("   COLD:", cold.strip()[:160].replace("\n", " "))
+    print(f"mismatches: image {bad['image']}/{len(questions)}, text control {bad['text']}/{len(questions)}")
+    return 0 if bad["image"] <= bad["text"] else 1
 
 
 def post(url: str, body: dict) -> tuple[int, dict]:
@@ -129,8 +171,13 @@ def server(args: argparse.Namespace) -> int:
 def reuse(args: argparse.Namespace) -> int:
     """Two-turn check of prefix reuse: the second turn repeats the first (same image) and adds a follow-up.
 
-    The cold answer is recomputed by erasing the slot cache (/slots/0?action=erase) and compared token for token."""
-    first = [user(args.question, args.image[:1])]
+    --pad N puts N numbered lines of text before the picture (a long prompt, so recurrent checkpoints exist);
+    --no-image sends the same conversation without the picture, the text-only baseline.
+    Warm == cold is checked in direct mode only (the server has no way to flush its page cache)."""
+    pad = "".join(f"Line {i}: the quick brown fox jumps over the lazy dog.\n" for i in range(args.pad))
+    first = [user(args.question, [] if args.no_image else args.image[:1])]
+    if pad:
+        first[0]["content"].insert(0, {"type": "text", "text": pad})
     s1, b1, t1 = ask(args.server, first, 120)
     a1 = show("turn 1 (cold)", s1, b1, t1)
     if s1 != 200:
@@ -141,12 +188,7 @@ def reuse(args: argparse.Namespace) -> int:
     cached = b2.get("timings", {}).get("cache_n", 0)
     prompt = b2["usage"]["prompt_tokens"]
     print(f"reuse: {cached}/{prompt} prompt tokens served from cache")
-    req = urllib.request.Request(args.server + "/slots/0?action=erase", b"{}", {"content-type": "application/json"}, method="POST")
-    urllib.request.urlopen(req, timeout=60).read()
-    s3, b3, t3 = ask(args.server, follow, 60)
-    cold = show("turn 2 (cold, cache erased)", s3, b3, t3)
-    print("warm == cold:", warm == cold)
-    return 0 if warm == cold and s3 == 200 else 1
+    return 0 if s2 == 200 else 1
 
 
 def main() -> int:
@@ -157,10 +199,14 @@ def main() -> int:
     parser.add_argument("--ctx", type=int, default=16384)
     parser.add_argument("--num-draft", type=int, default=2)
     parser.add_argument("--no-spec", action="store_true", help="direct mode without the MTP draft model")
+    parser.add_argument("--control-lines", type=int, default=60, help="--reuse-check: filler lines of the text-only control prompt")
+    parser.add_argument("--reuse-check", action="store_true", help="direct mode: turn 2 warm vs cold must give the same text")
     parser.add_argument("--max-image-tokens", type=int, default=1280)
     parser.add_argument("--max-new", type=int, default=200)
     parser.add_argument("--server", help="URL of a running serve.py: switches to server mode")
     parser.add_argument("--reuse", action="store_true", help="server mode: two-turn prefix reuse check")
+    parser.add_argument("--pad", type=int, default=0, help="--reuse: lines of filler text before the picture")
+    parser.add_argument("--no-image", action="store_true", help="--reuse: text-only baseline")
     args = parser.parse_args()
     return server(args) if args.server else direct(args)
 

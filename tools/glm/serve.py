@@ -384,6 +384,7 @@ class ResidentEngine:
                 self.vision = None
                 print(f"serve: vision tower not loaded ({exc!r}); image input disabled", flush=True)
         self.supports_vision = self.vision is not None
+        self.emb_cache = EmbeddingCache()
         self.greedy_generator = Generator(
             model=self.model, cache=self.cache, tokenizer=self.tokenizer,
             draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=num_draft,
@@ -398,8 +399,14 @@ class ResidentEngine:
         return int(self.tokenizer.encode(text, encode_special_tokens=True).numel())
 
     def _embed(self, images: list) -> list:
-        """One MMEmbedding per PIL image, in prompt order (blocking GPU work: run in an executor)."""
-        return [self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=image) for image in images]
+        """One MMEmbedding per PIL image, in prompt order (blocking GPU work: run in an executor).
+        A picture seen before comes back as the same object, with the token ids its KV pages were hashed on."""
+        def embed(image):
+            return self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=image)
+        out: list = []
+        for image in images:
+            out.append(self.emb_cache.get(image, embed, taken=out))
+        return out
 
     async def generate(self, prompt: str, *, max_tokens: int, temperature: float,
                        top_p: float, stop: list[str], sampler_kw: dict | None = None,
