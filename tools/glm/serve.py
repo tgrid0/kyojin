@@ -597,7 +597,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     """Build the HTTP layer around a resident engine (also accepts a fake engine in tests)."""
     queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue]] = asyncio.Queue()
     lock = asyncio.Lock()  # serializes generation with slot save/restore
-    app = web.Application(client_max_size=16 * 1024**2)
+    max_body_mb = int(os.environ.get("SERVE_MAX_REQUEST_MB", "64"))   # aiohttp rejects bigger bodies with 413
+    app = web.Application(client_max_size=max_body_mb * 1024**2)
     app.update(engine=engine, model_id=model_id, template=template, queue=queue)
 
     async def models(_: web.Request) -> web.Response:
